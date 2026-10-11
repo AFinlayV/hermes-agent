@@ -567,30 +567,29 @@ class MemoryStore:
     def _demote_failure(self, target: str, content: str, longest: int,
                         *, position: str = "Entry") -> Dict[str, Any]:
         """Unified over-cap outcome (used by add/replace/batch). With a demoter bound the
-        full text is ALREADY persisted in the long-term fact store; the result reports
+        full text is persisted to the long-term fact store and the result reports
         ``success: False`` (nothing was written to the memory file yet) but carries
         ``replace_with`` — the ``<=200``-char pointer — plus the fact id, so the caller
         reissues the same write with the pointer as the whole new content. Without a
-        demoter (or on a remove-shaped call with no content) the consolidation-failure
-        error is returned, worded like the memory-hygiene failure the old write would
-        later cause, with ``current_entries`` for consolidation. Content is never
-        truncated or dropped on either path."""
-        demoter = self._over_cap_demoter
-        if demoter is None or content is None:
-            failure = self._consolidation_failure(_error(_entry_cap_error(position, longest)))
-            if "current_entries" in failure:
-                return failure
-            return {**failure, "current_entries": self._entries_for(target), "usage": self._usage(target)}
-        fact_id, pointer = self._demote_over_cap(target, content)
-        if not pointer:
-            return _error(_entry_cap_error(position, longest))
-        return {"success": False, "replace_with": pointer,
-                "demoted_to_fact_id": fact_id, "demoted_content": content,
-                "error": (f"Content is over the {MAX_ENTRY_CHARS}-char per-line memory entry cap, so it was "
-                          f"NOT written to memory; the full text was demoted to the long-term fact store "
-                          f"(fact {fact_id}) — nothing was lost. Reissue the write with the value of "
-                          f"'replace_with' as the whole entry to leave a compliant pointer (or 'remove' "
-                          f"nothing and just rely on the fact store).")}
+        demoter (or when the demote itself fails, e.g. the store is locked) the
+        consolidation-failure error is returned, worded like the memory-hygiene failure
+        the old write would later cause. Content is never truncated or dropped here:
+        a failed demote means the store never received it, and the caller still holds
+        the full text it offered."""
+        if self._over_cap_demoter is not None and content:
+            try:
+                fact_id, pointer = self._demote_over_cap(target, content)
+            except Exception:
+                logger.warning("Over-cap demote to the long-term fact store failed; "
+                               "refusing the memory write instead", exc_info=True)
+            else:
+                return {"success": False, "replace_with": pointer,
+                        "demoted_to_fact_id": fact_id, "demoted_content": content,
+                        "error": (f"Content is over the {MAX_ENTRY_CHARS}-char per-line memory entry cap, so it was "
+                                  f"NOT written to memory; the full text was demoted to the long-term fact store "
+                                  f"(fact {fact_id}) — nothing was lost. Reissue the write with the value of "
+                                  f"'replace_with' as the whole entry to leave a compliant pointer.")}
+        return self._consolidation_failure(_error(_entry_cap_error(position, longest)))
 
     def _success_response(self, target: str, message: str = None, **extra) -> Dict[str, Any]:
         """TERMINAL and WITHOUT the entries list: echoing entries invites the model to
