@@ -3,12 +3,14 @@ Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independe
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
 in ``tools.memory_tool`` and is read lazily."""
 
+import hashlib
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils import atomic_write_text
 from tools.threat_patterns import first_threat_message as _first_threat_message
@@ -21,6 +23,44 @@ MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Per-entry cap enforced at every write path below AND by the live memory-file
+# hygiene check (alexthe5th-vps ops/healthcheck/memory_hygiene.py, MAX_ENTRY_CHARS —
+# keep the two in lockstep). Measured per LINE after stripping a bullet/numbered-list
+# prefix, ignoring full-line comments: exactly how the hygiene check reads a file.
+# The whole-file limits are the model-context budget; this cap keeps any single
+# entry from dominating it and from failing the hygiene check. Over-cap content is
+# demoted to the bound long-term fact store (``MemoryStore.bind_over_cap_demoter``)
+# or refused with recovery guidance — never truncated or dropped.
+MAX_ENTRY_CHARS = 200
+
+
+def _line_payload(line: str) -> str:
+    """Text the memory-file hygiene check measures on one line: bullet/numbered-list
+    prefix and outer whitespace stripped (full-line ``#`` comments are ignored by callers)."""
+    return re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+
+
+def entry_line_overflow(content: str) -> int:
+    """Longest single-line payload in *content* as the memory-file hygiene check
+    measures entries (bullet/numbered-prefix stripped, full-line ``#`` comments
+    ignored), or 0 when every payload line is within ``MAX_ENTRY_CHARS``.
+
+    Entries are ``\\n§\\n``-joined blocks that may still carry multiple lines, and the
+    hygiene check flags any single FILE line over the cap — so the write path measures
+    the same way instead of just ``len(content)``."""
+    worst = 0
+    for line in content.splitlines() or [""]:
+        text = _line_payload(line)
+        if text and not text.startswith("#") and len(text) > worst:
+            worst = len(text)
+    return worst
+
+
+def _entry_cap_error(position: str, longest: int) -> str:
+    return (f"{position}: entry is {longest} chars; every memory entry is limited to "
+            f"{MAX_ENTRY_CHARS} chars per line. Shorten the content, split it into smaller "
+            f"entries, or save the full text in the fact store and write a short pointer entry.")
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -95,6 +135,43 @@ class MemoryStore:
     # to budget exhaustion and suppress the user's reply.
     # See #42405.
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
+
+    # Over-cap demote hook: called with the over-cap content (metadata-prefixed) when a
+    # write would create an entry the memory-file hygiene check fails; it persists the
+    # content in a bound long-term store and returns the fact id (``add_fact``
+    # returns an existing id on duplicate content, so retries stay deduplicated).
+    # None (nothing bound): over-cap writes are refused with the same guidance the
+    # memory-hygiene failure message gives — no content is ever truncated or dropped.
+    _over_cap_demoter: Optional[Callable[[str], int]] = None
+
+    @classmethod
+    def bind_over_cap_demoter(cls, demoter: Optional[Callable[[str], int]]) -> None:
+        """Bind (or, with None, clear) the over-cap demote hook used by every write path.
+
+        ``bind_over_cap_demoter`` exists so the holographic fact store can be wired in
+        without a circular import — tools/ cannot import plugins/ at module load;
+        see ``plugins.memory.holographic.HolographicMemoryProvider.initialize``."""
+        cls._over_cap_demoter = demoter
+
+    @classmethod
+    def _demote_over_cap(cls, target: str, content: str) -> Tuple[Optional[int], str]:
+        """Hand over-cap content to the bound long-term store and build the compliant
+        pointer the caller should write instead. ``(fact_id, pointer)``; fact_id is None
+        and the pointer empty when nothing is bound. The pointer names the fact id (the
+        addressable row in the long-term store) and stays well under ``MAX_ENTRY_CHARS``.
+        The stored payload's ``[memory-demote …]`` metadata prefix is content-stable, so
+        a retried demote of the same content deduplicates to the same fact instead of
+        accumulating copies."""
+        label = "USER" if target == "user" else "MEMORY"
+        demoter = cls._over_cap_demoter
+        if demoter is None:
+            return None, ""
+        payload = f"[memory-demote target={label}] {content}"
+        fact_id = int(demoter(payload))
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+        pointer = (f"{label} detail (fact {fact_id}, {digest}): full text is in the "
+                   f"long-term fact store (fact {fact_id}); search fact_store for it.")
+        return fact_id, pointer
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
                  memory_enabled: bool = True, user_profile_enabled: bool = True):
@@ -274,7 +351,10 @@ class MemoryStore:
             return self._success_response(target, result[1], **extra_fields)
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+        """Append a new entry. Returns error if it would exceed the char limit.
+        Content that would fail the memory-file hygiene check's per-line cap is demoted
+        to the bound long-term fact store (a ``<=200``-char pointer is written to memory)
+        or refused when no store is bound — never truncated."""
         content = content.strip()
         if not content:
             return _error("Content cannot be empty.")
@@ -284,6 +364,8 @@ class MemoryStore:
         def _add(entries, limit):
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
+            if (longest := entry_line_overflow(content)) > MAX_ENTRY_CHARS:
+                return self._demote_failure(target, content, longest)
             if len(ENTRY_DELIMITER.join(entries + [content])) > limit:
                 return self._failure_with_entries(target, (
                     f"Memory at {self._char_count(target):,}/{limit:,} chars. Adding this entry "
@@ -351,6 +433,8 @@ class MemoryStore:
             replaced = entries[:idx] + ([] if new_content is None else [new_content]) + entries[idx + 1:]
             if new_content is None:
                 return replaced, "Entry removed.", {"removed_entry": entries[idx]}
+            if (longest := entry_line_overflow(new_content)) > MAX_ENTRY_CHARS:
+                return self._demote_failure(target, new_content, longest)
             new_total = len(ENTRY_DELIMITER.join(replaced))
             if new_total > limit:
                 return self._failure_with_entries(target, (
@@ -419,15 +503,30 @@ class MemoryStore:
                 return _error(f"Operation {i + 1}: {scan_error}")
 
         def _apply(entries, limit):
+            def pos_fmt(i: int, act: Optional[str]) -> str:
+                return f"Operation {i + 1} ({act or 'unknown'})"
             working = list(entries)  # only committed if the whole batch validates
             matched = []  # per op, the entry a replace/remove selected (None for add)
             for i, op in enumerate(ops):
-                act = op.get("action")
+                act = op.get("action") or ""
+                content = (op.get("content") or op.get("new_text") or "").strip()
                 msg, previous_content = self._apply_batch_op(
-                    working, act, (op.get("content") or op.get("new_text") or "").strip(),
+                    working, act, content,
                     (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})",
                     op.get("matched_entry"))
                 if msg:
+                    return self._batch_failure(target, msg)
+                # Over-cap content rejects the batch (all-or-nothing) rather than silently
+                # swapping a pointer into a consolidation whose other ops were sized against
+                # the original content — with demoter-aware guidance so nothing is lost.
+                if act in ("add", "replace") and (longest := entry_line_overflow(content)) > MAX_ENTRY_CHARS:
+                    if self._over_cap_demoter is not None:
+                        msg = (f"{pos_fmt(i, act)}: {_entry_cap_error('entry', longest)} Nothing was demoted "
+                               f"or written (the batch is all-or-nothing). Issue this content as a single add "
+                               f"first — it goes to the long-term fact store automatically and returns the "
+                               f"compliant pointer — then batch that pointer.")
+                    else:
+                        msg = f"{pos_fmt(i, act)}: {_entry_cap_error('entry', longest)}"
                     return self._batch_failure(target, msg)
                 matched.append(previous_content)
             if entries and not working:
@@ -464,6 +563,34 @@ class MemoryStore:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
         it, preserving the prefix cache); None if empty."""
         return self._system_prompt_snapshot.get(target, "") or None
+
+    def _demote_failure(self, target: str, content: str, longest: int,
+                        *, position: str = "Entry") -> Dict[str, Any]:
+        """Unified over-cap outcome (used by add/replace/batch). With a demoter bound the
+        full text is ALREADY persisted in the long-term fact store; the result reports
+        ``success: False`` (nothing was written to the memory file yet) but carries
+        ``replace_with`` — the ``<=200``-char pointer — plus the fact id, so the caller
+        reissues the same write with the pointer as the whole new content. Without a
+        demoter (or on a remove-shaped call with no content) the consolidation-failure
+        error is returned, worded like the memory-hygiene failure the old write would
+        later cause, with ``current_entries`` for consolidation. Content is never
+        truncated or dropped on either path."""
+        demoter = self._over_cap_demoter
+        if demoter is None or content is None:
+            failure = self._consolidation_failure(_error(_entry_cap_error(position, longest)))
+            if "current_entries" in failure:
+                return failure
+            return {**failure, "current_entries": self._entries_for(target), "usage": self._usage(target)}
+        fact_id, pointer = self._demote_over_cap(target, content)
+        if not pointer:
+            return _error(_entry_cap_error(position, longest))
+        return {"success": False, "replace_with": pointer,
+                "demoted_to_fact_id": fact_id, "demoted_content": content,
+                "error": (f"Content is over the {MAX_ENTRY_CHARS}-char per-line memory entry cap, so it was "
+                          f"NOT written to memory; the full text was demoted to the long-term fact store "
+                          f"(fact {fact_id}) — nothing was lost. Reissue the write with the value of "
+                          f"'replace_with' as the whole entry to leave a compliant pointer (or 'remove' "
+                          f"nothing and just rely on the fact store).")}
 
     def _success_response(self, target: str, message: str = None, **extra) -> Dict[str, Any]:
         """TERMINAL and WITHOUT the entries list: echoing entries invites the model to

@@ -143,10 +143,23 @@ class HolographicMemoryProvider(MemoryProvider):
         if isinstance(db_path, str):  # expand $HERMES_HOME so paths resolve to the active profile
             db_path = db_path.replace("$HERMES_HOME", _hermes_home).replace("${HERMES_HOME}", _hermes_home)
         hrr_dim = int(self._config.get("hrr_dim", 1024))
-        self._store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
-        self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
+        # ONE store instance feeds the retriever, the tool handlers, self._store AND the
+        # demote hook (the shared-connection registry refcounts per construction; a second
+        # construction would leak an un-closable reference on shutdown).
+        store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
+        self._store = store
+        self._retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
                                         temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
         self._session_id = session_id
+        # The built-in memory tool cannot import plugins/ (circular import), so it exposes a
+        # class-level demote hook instead: entries its write paths find over the memory-file
+        # hygiene cap are demoted HERE — this store's unbounded long-term facts — while the
+        # memory file receives only a compliant pointer. shutdown() unbinds it again when it
+        # is still ours; no provider at all → the hook stays unbound and over-cap writes are
+        # refused with recovery guidance (never truncated or lost).
+        from tools.memory_tool_store import MemoryStore as _BuiltinMemoryStore
+        self._demote_hook = lambda payload: store.add_fact(payload, category="general")
+        _BuiltinMemoryStore.bind_over_cap_demoter(self._demote_hook)
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -206,6 +219,16 @@ class HolographicMemoryProvider(MemoryProvider):
                 self._store.close()
             except Exception as e:
                 logger.debug("Holographic shutdown close() failed: %s", e)
+        # Unbind the over-cap demote hook while it is still OURS, so a closed store never
+        # sits behind the built-in write path. A newer provider (rebound since) is left alone.
+        if getattr(self, "_demote_hook", None) is not None:
+            try:
+                from tools.memory_tool_store import MemoryStore as _BuiltinMemoryStore
+                if _BuiltinMemoryStore._over_cap_demoter is self._demote_hook:
+                    _BuiltinMemoryStore.bind_over_cap_demoter(None)
+            except Exception as e:  # the hook binding is best-effort; never block shutdown
+                logger.debug("Holographic shutdown demote unbind failed: %s", e)
+            self._demote_hook = None
         self._store = self._retriever = None
 
     # Tool handlers (self, args) -> str. KeyError from args[...] / Exception -> tool_error in handle_tool_call;

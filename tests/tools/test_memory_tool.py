@@ -1,7 +1,9 @@
 """Tests for tools/memory_tool.py — MemoryStore, security scanning, and tool dispatcher."""
 
+import hashlib
 import json
 import os
+import re
 import stat
 import pytest
 from pathlib import Path
@@ -163,8 +165,13 @@ class TestMemoryStoreAdd:
 
 
     def test_overflow_returns_consolidation_context(self, store):
-        store.add("memory", "x" * 490)
-        result = store.add("memory", "this will exceed the limit")
+        # Entries stay under the 200-char per-line cap (the entry-cap guard is tested
+        # separately); the whole-FILE budget is what refuses here.
+        fat = "m " * 99  # 198 chars, single line
+        fat2 = "n " * 99  # 198 chars, distinct
+        store.add("memory", fat)
+        store.add("memory", fat2)
+        result = store.add("memory", "word " * 22)  # 110 chars -> pushes the file over 500
         assert result["success"] is False
         assert "exceed" in result["error"].lower()
         # Overflow response gives the model what it needs to consolidate in-turn
@@ -173,7 +180,8 @@ class TestMemoryStoreAdd:
         assert "retry" in result["error"].lower()
 
         # A replace that blows the budget mirrors the add-overflow shape.
-        result = store.replace("memory", "x" * 490, "y" * 600)
+        blob = "\n".join(("y " * 65).rstrip() for _ in range(5))  # 5 lines x 130 chars
+        result = store.replace("memory", fat, blob)
         assert result["success"] is False
         assert "current_entries" in result
         assert "usage" in result
@@ -286,6 +294,152 @@ class TestExactWholeEntryMatchPriority:
         result = store.apply_batch("memory", [{"action": "remove", "old_text": "test"}])
         assert result["success"] is True
         assert store.memory_entries == ["echo-reply tests pass via local twins and are false positives"]
+
+
+# =========================================================================
+# Per-entry cap (200 chars/line) with non-lossy over-cap demote (#memory-hygiene)
+# =========================================================================
+
+_OVER_CAP = "Recurring-failure cause fix: " + "x" * 290
+
+
+class TestEntryCapGuard:
+    """The write path must never produce an entry the memory-file hygiene check
+    (MAX_ENTRY_CHARS = 200/line) flags. Without a bound demoter the write is refused;
+    with one bound the full text is demoted to that store and a compliant pointer is
+    returned instead — the content is never truncated and never silently dropped."""
+
+    def test_add_refused_without_demoter(self, store):
+        result = store.add("memory", _OVER_CAP)
+        assert result["success"] is False
+        assert "200" in result["error"]
+        assert store.memory_entries == []
+
+    def test_add_demotes_and_returns_pointer_with_demoter(self, store):
+        stored = []
+        store.bind_over_cap_demoter(lambda payload: (stored.append(payload), 4001)[1])
+        result = store.add("memory", _OVER_CAP)
+        assert result["success"] is False  # nothing written to memory yet...
+        assert store.memory_entries == []
+        assert "replace_with" in result, result
+        pointer = result["replace_with"]
+        assert len(pointer) <= 200
+        assert "fact" in pointer and str(result["demoted_to_fact_id"]) in pointer
+        # ...but the FULL text already lives in the long-term store.
+        assert stored and "Recurring-failure cause fix:" in stored[0]
+        # Follow-up: writing the pointer is a normal compliant add.
+        assert store.add("memory", pointer)["success"] is True
+        assert "Recurring-failure cause fix:" not in (store._path_for("memory").read_text())
+
+    def test_add_demoter_returns_existing_fact_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        store = MemoryStore(memory_char_limit=2200, user_char_limit=1375)
+        store.bind_over_cap_demoter(lambda payload: 77)
+        result = store.add("memory", _OVER_CAP)
+        assert result["demoted_to_fact_id"] == 77
+        assert result["demoted_content"] == _OVER_CAP
+
+    def test_replace_refused_and_demoted_like_add(self, store):
+        store.add("memory", "short original entry")
+        # No demoter: refuse.
+        result = store.replace("memory", "short original", _OVER_CAP)
+        assert result["success"] is False
+        assert store.memory_entries == ["short original entry"]
+        # With a demoter: demote, keep the original, offer the pointer.
+        stored = []
+        store.bind_over_cap_demoter(lambda payload: (stored.append(payload), 5001)[1])
+        result = store.replace("memory", "short original", _OVER_CAP)
+        assert result["success"] is False
+        assert store.memory_entries == ["short original entry"]
+        assert result["replace_with"] and stored
+        replay = store.replace("memory", "short original", result["replace_with"])
+        assert replay["success"] is True
+        assert store.memory_entries == [result["replace_with"]]
+
+    def test_batch_over_cap_rejects_all_or_nothing(self, store):
+        store.add("memory", "existing entry stays")
+        store.bind_over_cap_demoter(lambda payload: 6001)
+        result = store.apply_batch("memory", [
+            {"action": "remove", "old_text": "existing entry stays"},
+            {"action": "add", "content": _OVER_CAP},
+        ])
+        assert result["success"] is False
+        # All-or-nothing: even the valid remove did not land, nothing was demoted.
+        assert store.memory_entries == ["existing entry stays"]
+        assert "fact store" in result["error"]
+        # Same rejection on the wet path with no demoter bound (fresh store, no hook).
+        dry = MemoryStore(memory_char_limit=2200, user_char_limit=1375)
+        result = dry.apply_batch("memory", [{"action": "add", "content": _OVER_CAP}])
+        assert result["success"] is False
+        assert "200" in result["error"]
+
+    def test_bound_hook_is_cleared_for_later_tests(self, store):
+        store.bind_over_cap_demoter(lambda payload: 1)
+        store.bind_over_cap_demoter(None)
+        assert store.add("memory", _OVER_CAP)["success"] is False
+
+    def test_multiline_entry_measured_per_line_like_hygiene_check(self, store):
+        # Each line is 225 chars (> 200 cap), though the whole entry is one payload
+        # the 200-char rule only flags per FILE line — exactly what the check measures.
+        wrapped = "\n".join(("word " * 45).rstrip() for _ in range(5))
+        result = store.add("memory", wrapped)
+        assert result["success"] is False
+        assert "200" in result["error"]
+
+    def test_short_entry_with_trailing_bullet_is_compliant(self, store):
+        result = store.add("memory", "- " + "fact " * 20)
+        assert result["success"] is True
+
+
+class TestHygieneFixtureContract:
+    """End-to-end against a scratch-HERMES_HOME fixture and the REAL check logic: an
+    over-cap attempted write or repair leaves no MEMORY.md entry over the cap, the
+    full text stays recoverable from the long-term store, and the hygiene check
+    passes. The live checker (alexthe5th-vps ops/healthcheck/memory_hygiene.py, run
+    with HERMES_HOME=$HERMES_HOME) is stdlib-only and repo-free; this class replays
+    its exact per-line rule and the module itself is exercised by that repo's tests."""
+
+    @staticmethod
+    def _hygiene_failures(path: Path):
+        failures = []
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            payload = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+            if payload and not payload.startswith("#") and len(payload) > 200:
+                failures.append(f"{path}:{number}: entry is {len(payload)} chars; maximum is 200")
+        return failures
+
+    def test_over_cap_write_and_pointer_followup_pass_check(self, store):
+        stored = []
+        store.bind_over_cap_demoter(lambda payload: (stored.append(payload), 7001)[1])
+        result = store.add("memory", _OVER_CAP)
+        assert result["success"] is False and stored, "over-cap write must demote, not truncate"
+        pointer = result["replace_with"]
+        assert len(pointer) <= 200
+        assert store.add("memory", pointer)["success"] is True
+        memory_path = store._path_for("memory")
+        assert self._hygiene_failures(memory_path) == []
+        # Recoverable: the full text is in the long-term store, and the pointer
+        # embeds a digest of the exact content.
+        import hashlib
+        digest = hashlib.sha256(_OVER_CAP.encode("utf-8")).hexdigest()[:8]
+        assert digest in pointer
+        assert _OVER_CAP in stored[0]
+
+    def test_repair_demotes_preexisting_over_cap_entry_and_check_passes(self, store):
+        """The heal shape: a file already containing an over-cap entry (as the hygiene
+        check found it) is repaired through the tool — demote, then replace with the
+        pointer — and the check then passes, content retrievable."""
+        store.bind_over_cap_demoter(lambda payload: 8001)
+        store.add("memory", "good short entry")
+        store.memory_entries.append(_OVER_CAP)
+        store._write_file(store._path_for("memory"), store.memory_entries)
+        assert self._hygiene_failures(store._path_for("memory")), "fixture must start red"
+        pointer = ("MEMORY detail (fact 8001, " + hashlib.sha256(
+            _OVER_CAP.encode("utf-8")).hexdigest()[:8] + "): full text is in the long-term fact store "
+            "(fact 8001); search fact_store for it.")
+        assert len(pointer) <= 200
+        assert store.replace("memory", "Recurring-failure cause fix:", pointer)["success"] is True
+        assert self._hygiene_failures(store._path_for("memory")) == []
 
 
 class TestMemoryConsolidationGracefulDegrade:
