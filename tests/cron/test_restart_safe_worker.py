@@ -648,6 +648,57 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     assert "PYTHONPATH" not in worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
 
 
+def test_launch_external_worker_env_carries_dependency_site_packages(
+    tmp_path, monkeypatch,
+):
+    """The bare store-Python worker can import hermes-agent's third-party deps only if
+    the selected dependency environment's site-packages ride along on PYTHONPATH
+    (t_bb338f6c: gateway-ticked workers died on ``from ruamel.yaml import YAML``).
+    ``pm.environments`` decides the path, so a record that cannot be read or that
+    lacks a real ``pyvenv.cfg`` must degrade to today's env — never raise from the
+    spawn path."""
+    import cron.scheduler as scheduler
+    import cron.scheduler_worker_env as worker_env_mod
+    from tools.process_registry import GatewayChildDispatch
+
+    site = tmp_path / "generation" / "venv" / "lib" / "python3.14" / "site-packages"
+    site.mkdir(parents=True)
+    venv = site.parent.parent
+    (venv / "pyvenv.cfg").write_text("home = /tmp/store-python\ninclude-system-site-packages = false\n")
+
+    job = {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_: GatewayChildDispatch("degraded", command),
+    )
+    monkeypatch.setattr(
+        "tools.environments.local.build_subprocess_env",
+        lambda **_: {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""},
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_worker_env._dependency_site_packages",
+        lambda repo_root: str(site),
+        raising=False,
+    )
+    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    repo_root = Path(scheduler.__file__).resolve().parent.parent
+
+    assert scheduler._launch_external_cron_worker(job) is True
+    entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
+    assert entries == [str(repo_root), str(site)]
+
+    # Missing/absent dependency site: degrade to the old env, never raise.
+    monkeypatch.setattr(
+        "cron.scheduler_worker_env._dependency_site_packages",
+        lambda repo_root: None,
+    )
+    spawned2, _p2, _h2, _g2 = _stub_external_worker_launch(scheduler, monkeypatch)
+    assert scheduler._launch_external_cron_worker(job) is True
+    entries2 = spawned2[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
+    assert entries2 == [str(repo_root)]
+
+
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
     import cron.scheduler as scheduler
 
