@@ -940,12 +940,30 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        # Foreground guard (t_fe2b14bc): under a worker scope cgroup with a usable
+        # systemd user bus, wrap the command in a fresh transient scope with
+        # MemoryMax + MemorySwapMax=0 + RuntimeMaxSec, so one runaway foreground
+        # command dies in its own cgroup instead of taking the worker (and with
+        # swap exhausted, the box) down. Probed + cached; any failure or non-worker
+        # caller runs exactly the historical argv.
+        fg_guarded = False
+        if not _IS_WINDOWS:
+            from tools import fg_guard
+            if fg_guard.guard_active():
+                wrapped = fg_guard.fg_guard_scope_argv(args, unit_suffix=str(os.getpid()))
+                if wrapped:
+                    args = wrapped
+                    fg_guarded = True
         proc = subprocess.Popen(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        if fg_guarded:
+            setattr(proc, "_hermes_fg_guarded", True)
+            with contextlib.suppress(Exception):
+                setattr(proc, "_hermes_spawn_monotonic", time.monotonic())  # RuntimeMaxSec label gate
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)

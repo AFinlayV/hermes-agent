@@ -542,7 +542,29 @@ class BaseEnvironment(ABC):
         stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
         if stdin_thread is not None:
             stdin_thread.join(timeout=5)
+
+        # Foreground guard (t_fe2b14bc): a command killed by its guard systemd
+        # scope (MemoryMax OOM-kill / RuntimeMaxSec expiry) gets a clear,
+        # card-readable line so downstream retries see "the cap killed it",
+        # not a mysterious exit code. Only for spawns wrapped by the guard
+        # (_hermes_fg_guarded); an ordinary 137/143/124 exit is untouched.
+        # Appended to the normal render instead of early-returning so the
+        # stdin-writer join and error handling above are shared, not bypassed.
+        kill_line = None
+        # 137/143/124: bash reported a killed child (or `timeout`'s code).
+        # -9/-15: the scope chain itself died by signal (systemd kills the whole
+        # cgroup on MemoryMax OOM and RuntimeMaxSec expiry, so systemd-run/bash
+        # die by signal too). Both conventions mean the cap fired.
+        if ((proc.returncode in (137, 143, 124) or proc.returncode in (-9, -15))
+                and getattr(proc, "_hermes_fg_guarded", False)):
+            from tools import fg_guard
+            spawn_at = getattr(proc, "_hermes_spawn_monotonic", None)
+            elapsed = (time.monotonic() - spawn_at) if spawn_at is not None else None
+            kill_line = fg_guard.systemd_scope_oom_kill_line(proc.returncode, elapsed_seconds=elapsed)
+
         rendered = output.render()
+        if kill_line:
+            rendered = rendered.rstrip("\n") + f"\n{kill_line}\n"
         result = self._finalize_wait_result(output, rendered, proc.returncode)
         if stdin_errors := getattr(proc, "_hermes_stdin_errors", None):
             result["stdin_error"] = err = str(stdin_errors[0])

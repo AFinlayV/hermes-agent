@@ -167,11 +167,15 @@ def _worker_memory_max_bytes() -> int:
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486)."""
+    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
+    ``MemorySwapMax=0`` (t_fe2b14bc): a worker process must die inside its own
+    MemoryMax instead of draining the machine's swap — the 2026-11-15 box freeze
+    was swap exhaustion (5.4 of 7.7 GB) behind two unbounded worker commands."""
     return [
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property", "MemorySwapMax=0",
         "--", *argv,
     ]
 
