@@ -7053,7 +7053,13 @@ async def _standalone_send(
                         ]
                         starter_message = {"content": (caption or message), "attachments": attachments_meta}
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
-                        form = aiohttp.FormData()
+                        # Discord stores the multipart filename verbatim as the
+                        # attachment name; RFC 7578 percent-quoting (aiohttp's
+                        # default) double-encodes it on disk (space -> "%20").
+                        # discord.py's own http client sends quote_fields=False
+                        # for the same reason — see tests/tools/
+                        # test_discord_upload_filename_encoding.py.
+                        form = aiohttp.FormData(quote_fields=False)
                         form.add_field("payload_json", payload_json, content_type="application/json")
                         try:
                             for idx, media_path in enumerate(valid_media):
@@ -7112,7 +7118,8 @@ async def _standalone_send(
                             logger.warning("Discord caption-fallback send failed for missing media")
                     continue
                 try:
-                    form = aiohttp.FormData()
+                    # quote_fields=False — see the forum-thread form above.
+                    form = aiohttp.FormData(quote_fields=False)
                     filename = os.path.basename(media_path)
                     if caption_pending:
                         form.add_field(
